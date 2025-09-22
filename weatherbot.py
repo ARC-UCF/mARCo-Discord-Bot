@@ -82,11 +82,11 @@ lastDate = None
 wfo_grid_x = 26
 wfo_grid_y = 68
 
-roads_shp = r"C:\Users\sheri\OneDrive\Desktop\WeatherAlerts\ne_10m_roads_north_america.shp" # Natural Earth road shapefile path.
+roads_shp = r"\OneDrive\Desktop\WeatherAlerts\ne_10m_roads_north_america.shp" # Natural Earth road shapefile path. Full path present in actual code.
 profile_picture = r"https://cdn.discordapp.com/attachments/1167929494147074098/1286378798366552184/image.png?ex=66ed0b40&is=66ebbac0&hm=5a3647a6dbb7e1f30c6d2b198f0e0862a77057a234d56708d4e7c1f2bb92d537&"
 author = "ARC ALERTS @ UCF"
 
-globalRequestHeader = {"User-Agent": "ARC ALERTS @ UCF (4noahsentelle@gmail.com)"} # Global header for all API requests made through the bot. Email is required. 
+globalRequestHeader = {"User-Agent": "ARC ALERTS @ UCF ()"} # Global header for all API requests made through the bot. Email is required. Present in actual code.
 
 # Actively monitored counties. Point must be in these counties in order to be alerted for.
 # Uses FLC and FLZ areas, so any county added will be monitored, as long as it is within Florida.
@@ -1229,4 +1229,5 @@ async def monitoring(interaction: discord.Interaction):
     county_string = ", ".join(sorted(counties))
     await interaction.response.send_message("I am currently monitoring the following counties: " + county_string)
     
+
 client.run(TOKEN)
