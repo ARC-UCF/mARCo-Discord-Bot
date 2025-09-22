@@ -989,7 +989,7 @@ async def on_ready():
                             web_volusia.send(embed=embed, username=author, avatar_url=profile_picture)
                     if "brevard" in affected:
                         print("Brevard County is affected by this alert.")
-                        if alert["same_coce"] in alertCodes:
+                        if alert["same_code"] in alertCodes:
                             web_brevard.send("<@&1406352415137075240>", username=author, avatar_url=profile_picture)
                             
                         if buf:
@@ -1231,3 +1231,4 @@ async def monitoring(interaction: discord.Interaction):
     
 
 client.run(TOKEN)
+
