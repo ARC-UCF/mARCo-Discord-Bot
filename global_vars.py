@@ -1,5 +1,5 @@
 globalRequestHeader = {"User-Agent": "ARC ALERTS @ UCF (4noahsentelle@gmail.com)"}
-VersionID = "1.1.0"
+VersionID = "1.2.0"
 
 buffer_WEASTrigger = 3 # Within how many miles is our buffer?
 alertCheck_Time = 90 # Time (in seconds) between each alert check. 
