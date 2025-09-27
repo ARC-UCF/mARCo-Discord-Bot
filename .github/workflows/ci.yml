@@ -1,0 +1,28 @@
+# .pre-commit-config.yaml
+# Run Black, Ruff (with autofix)
+
+default_language_version:
+  python: python3.10
+
+exclude: |
+  (?x)^(
+    \.venv/|
+    build/|
+    dist/|
+    .*\.egg-info/
+  )
+
+repos:
+  - repo: https://github.com/psf/black
+    rev: 24.8.0
+    hooks:
+      - id: black
+        language_version: python3.10
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        # --fix applies safe autofixes (imports, whitespace, simple rewrites, etc.)
+        args: ["--fix"]
+        language_version: python3.10

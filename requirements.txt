@@ -1,0 +1,7 @@
+discord.py>=2.3
+python-dotenv>=1.0
+requests>=2.32
+shapely>=2.0
+matplotlib>=3.8
+skyfield>=1.49
+sgp4>=2.23

@@ -1,0 +1,9 @@
+.venv/
+data/
+__pycache__/
+*.pyc
+.marco.sqlite3
+.env
+dist/
+build/
+*.egg-info/
