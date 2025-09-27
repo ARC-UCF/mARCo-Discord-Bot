@@ -1,202 +1,72 @@
-here’s a drop-in **README.md** you can paste over the current one. it’s thorough, shows how to run **after cloning**, and includes Windows/macOS/Linux steps, env setup, and troubleshooting.
+# mARCo Discord Bot
 
+We now run **two different bots** at ARC @ UCF, each serving its own purpose. The first is **mARCo**, our general-purpose bot that handles club utilities, commands, and learning resources for members. The second is the **ARC Alerts / Weather Bot**, powered by the [Weather Bot](https://github.com/ARC-UCF/NWS-Thorguard-API-Module), which focuses on delivering **all-hazards alerts and weather information** for UCF and the wider county. Both bots are designed with clarity, reliability, and documentation in mind — and just like mARCo, the weather bot is an amazing tool worth checking out if you haven’t already. Together, they give the club a solid combination: one for day-to-day and educational needs, and one dedicated to **safety and real-time alerts**.
+
+
+For more technical explanations and deeper implementation details, please refer to the docs/
 ---
 
-# mARCo Discord Bot — Refactored
-
-A structured refactor of the original **mARCo-Discord-Bot** with a clean separation between **commands** (cogs) and **logic** (services). It polls active NOAA/NWS alerts, can post short forecasts, and sends messages to Discord via webhooks or bot channels.
-
-## ✨ Features
-
-* **discord.py 2.x** with slash commands (Cogs in `marco_bot/cogs`)
-* **Logic separated from commands** (`marco_bot/services`)
-* **Background tasks** with `discord.ext.tasks` (alert polling)
-* **Config via `.env`** (token, guild, webhooks, NWS settings)
-* **Lightweight map images** of alert polygons via `matplotlib` (no heavy GIS deps)
-* Sensible logging and error handling
-
-## 🧰 Tech & Layout
-
-```
-marco_bot/
-  __init__.py
-  __main__.py            # enables: python -m marco_bot
-  bot.py                 # bot bootstrap & command sync
-  config.py              # loads .env -> Config dataclass
-  models/
-    alert.py
-  services/
-    alerts.py            # NWS alerts
-    forecast.py          # NWS grid forecast helpers
-    geometry.py          # in/near checks + simple map image
-    webhooks.py
-    thor_guard.py        # stub, ready for integration
-  cogs/
-    admin.py             # /ping, /version
-    alerts.py            # /alerts status, /alerts post-forecast
-utils/
-  logging.py
-.env.example
-requirements.txt
-pyproject.toml
-README.md
-```
-
----
-
-## 🚀 Getting Started (after cloning)
-
-### 1) Clone the repo
-
+## 1) Get the code
 ```bash
-# Option A: your fork/clone
-git clone https://github.com/IberAI/mARCo-Discord-Bot.git
-cd mARCo-Discord-Bot-refactor
-
-# Option B: if you downloaded a zip, just unzip and cd into the folder instead
+git clone <your-repo-url>
+cd <your-repo-folder>
 ```
 
-### 2) Python & virtual environment
-
-You need Python **3.10+**.
-
-**macOS / Linux**
-
+## 2) Set up the bot info
+Copy the example settings and fill in your Discord bot token.
 ```bash
-python3 --version
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-**Windows (PowerShell)**
-
-```powershell
-py --version
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-# If you get an execution policy error, run:
-# Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-### 3) Create your `.env`
-
-Copy the example and fill in the values:
-
-```bash
-# macOS/Linux
 cp .env.example .env
-# Windows
-# copy .env.example .env
 ```
+Open `.env` in a text editor and set:
+- `DISCORD_TOKEN=` your Discord bot token
+- `GUILD_ID=` your server ID for faster command sync
 
-**Required**
+> Tip: Create a bot and get the token in the Discord Developer Portal.
 
-* `API_TOKEN` — your Discord bot token
+---
 
-**Recommended**
-
-* `GUILD_ID` — your server (guild) ID so slash commands sync instantly
-* `NWS_CONTACT_EMAIL` — real contact email (NWS requires this in the User-Agent)
-
-**Optional webhooks**
-Set any you want the bot to post to (e.g. forecasts, county-specific):
-`FORECAST_URL`, `ARC_URL`, `ORANGE_URL`, `SEMINOLE_URL`, `BREVARD_URL`, `VOLUSIA_URL`, `LAKE_URL`, `OSCEOLA_URL`, `ST_JOHNS_URL`, `POLK_URL`, `FLAGLER_URL`, `MARINE_URL`, `WEBHOOK_URL`
-
-**Defaults**
-
-* `WFO_ID=MLB`, `GRID_X=26`, `GRID_Y=68` (NWS grid point)
-* `ALERT_CHECK_SECONDS=90` (polling interval)
-* `WEAS_BUFFER_MILES=3` (proximity buffer)
-
-> 💡 To get a Webhook URL in Discord: **Server Settings → Integrations → Webhooks → New Webhook → Copy URL**.
-
-### 4) Invite the bot to your server (one-time)
-
-In the **Discord Developer Portal** for your application:
-
-1. Go to **OAuth2 → URL Generator**
-2. Scopes: `bot`, `applications.commands`
-3. Bot permissions: at minimum **Send Messages** and **Embed Links**
-4. Open the generated URL and add the bot to your server
-
-### 5) Run the bot
+## (Recommended) Use a virtual environment — Linux
+Keep things clean by installing packages only for this project.
 
 ```bash
-# From the project root (where requirements.txt lives)
+# Create a virtual environment in a folder named .venv
+python3 -m venv .venv
+
+# Activate it (run this in every new terminal before working on the bot)
+source .venv/bin/activate
+
+# (Optional) Check that you're using the venv Python
+which python
+```
+
+To exit the virtual environment later:
+```bash
+deactivate
+```
+
+---
+
+## 3) Install requirements
+Make sure you have Python 3.10+ installed.
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+## 4) Start the bot
+```bash
 python -m marco_bot
 ```
+If it starts without errors, the bot is online.
 
-**Slash command sync behavior**
-
-* If **`GUILD_ID` is set**, commands sync **immediately** to that guild.
-* If not, they sync **globally** and can take up to \~1 hour to appear (Discord limitation).
-
----
-
-## 🧪 Quick Test
-
-In your server, try:
-
-* `/ping` → replies `pong` (ephemeral)
-* `/version` → shows the bot’s version
-* `/alerts status` → shows current polling/track state
-* `/alerts post-forecast` → posts the short forecast to `FORECAST_URL` (if configured)
+## 5) Test it on your server
+In any channel where the bot can read and send messages:
+- Type `/ping` → the bot should reply **pong**
 
 ---
 
-## ⚙️ Configuration Reference
+## Stop the bot
+Press `CTRL + C` in the terminal where it’s running.
 
-| Variable                                 | What it does                                     | Required      |
-| ---------------------------------------- | ------------------------------------------------ | ------------- |
-| `API_TOKEN`                              | Discord bot token                                | ✅             |
-| `GUILD_ID`                               | Guild (server) ID for instant slash-command sync | ➕ recommended |
-| `NWS_CONTACT_EMAIL`                      | Contact email for NWS User-Agent                 | ➕ recommended |
-| `WFO_ID`                                 | NWS office (default `MLB`)                       | optional      |
-| `GRID_X`, `GRID_Y`                       | Grid point (default `26, 68`)                    | optional      |
-| `ALERT_CHECK_SECONDS`                    | Polling interval (default `90`)                  | optional      |
-| `WEAS_BUFFER_MILES`                      | UCF proximity buffer (default `3`)               | optional      |
-| `WEBHOOK_URL`                            | Generic webhook                                  | optional      |
-| `FORECAST_URL`                           | Forecast posts target                            | optional      |
-| `ARC_URL`, `HURRICANE_URL`, county URLs… | Additional targets                               | optional      |
-
----
-
-## 🧩 Commands
-
-* `/ping` — health check
-* `/version` — bot version
-* `/alerts status` — show status of the alert poller
-* `/alerts post-forecast` — fetch & post short forecast to the forecast webhook
-
----
-
-## 🔍 Troubleshooting
-
-* **Slash commands don’t appear**
-  Set a valid `GUILD_ID` in `.env` and restart the bot.
-
-* **401 / invalid token**
-  Double-check `API_TOKEN` (no quotes or trailing spaces).
-
-* **NWS requests blocked**
-  Set a real `NWS_CONTACT_EMAIL` so the User-Agent header is accepted.
-
-* **Webhook didn’t post**
-  Ensure the `*_URL` you set is a valid Discord Webhook URL and the bot process has network access.
-
-* **Linux: venv missing**
-  Install it: `sudo apt-get update && sudo apt-get install -y python3-venv`.
-
----
-
-## 🛠️ Development
-
-* Activate venv and run `python -m marco_bot` (hot-reload isn’t built-in; restart after code changes).
-* The alert polling task uses `discord.ext.tasks` and adapts to `ALERT_CHECK_SECONDS`.
-* Map images are generated with **matplotlib** only; if you want Cartopy/GeoPandas maps, swap in your preferred implementation in `services/geometry.py` and install the extra deps.
-
----
+## You’re all set!
+Invite the bot to your server and use it.

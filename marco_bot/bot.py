@@ -20,7 +20,9 @@ class MarcoBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.load_extension("marco_bot.cogs.admin")
-        await self.load_extension("marco_bot.cogs.alerts")
+        await self.load_extension("marco_bot.cogs.iss")
+        await self.load_extension("marco_bot.cogs.club")
+        await self.load_extension("marco_bot.cogs.callsign")
 
         # Sync commands
         if self.config.guild_id:
