@@ -1,0 +1,23 @@
+[Unit]
+Description=Discord Bot: mARCo 
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=il461397
+WorkingDirectory=/home/il461397/discord_bots/mARCo-Discord-Bot
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/il461397/discord_bots/mARCo-Discord-Bot/.env
+ExecStart=/home/il461397/discord_bots/mARCo-Discord-Bot/.venv/bin/python -m marco_bot
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+# Journald logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

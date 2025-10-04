@@ -1,233 +1,209 @@
 from __future__ import annotations
 
 import asyncio
-import datetime as dt
+import random
 from dataclasses import dataclass
-from typing import List, Optional, Iterable, Dict, Any
+from typing import Dict, Optional, Tuple
 
-from skyfield.api import Loader, wgs84, EarthSatellite
+import aiohttp
+from aiohttp import ClientTimeout
+import discord
+from discord.ext import tasks
 
-__all__ = [
-    "UCF_LAT",
-    "UCF_LON",
-    "UCF_ALT_M",
-    "DEFAULT_PASS_SCAN_DAYS",
-    "DEFAULT_MIN_ELEVATION_DEG",
-    "PassWindow",
-    "ISSPredictor",
-]
-
-UCF_LAT: float = 28.602  # degrees
-UCF_LON: float = -81.200  # degrees
-UCF_ALT_M: float = 30.0  # meters
-
-# Try several CelesTrak endpoints in order, with unique cache filenames
-CELESTRAK_ENDPOINTS: List[tuple[str, str]] = [
-    ("https://celestrak.org/NORAD/elements/stations.txt", "stations.txt"),
-    (
-        "https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&TLE=1",
-        "stations_gp_stations.tle",
-    ),
-    ("https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&TLE=1", "iss_25544.tle"),
-]
-
-DEFAULT_PASS_SCAN_DAYS: int = 3
-DEFAULT_MIN_ELEVATION_DEG: float = 10.0
+# Open Notify API for ISS pass predictions
+OPEN_NOTIFY = "http://api.open-notify.org/iss-pass.json"
 
 
-# ---- Data model --------------------------------------------------------------
+@dataclass
+class GuildISSState:
+    """In-memory cache + settings for one guild."""
+    lat: float
+    lon: float
+    alt_m: Optional[int]
+    # Announce when the pass start is within this many seconds
+    lead_seconds: int = 21600  # 6 hours
+    # Prevent duplicate announcements for the same pass start time
+    last_announced_start: Optional[int] = None
+    # Avoid hammering the API
+    cached_next: Optional[Tuple[int, int]] = None  # (risetime_epoch, duration_s)
+    cached_at_epoch: int = 0
 
 
-@dataclass(slots=True)
-class PassWindow:
-    """One satellite pass with rise/culmination/set and key angles (all UTC, degrees)."""
-
-    aos: dt.datetime
-    tca: dt.datetime
-    los: dt.datetime
-    max_elevation_deg: float
-    az_at_aos_deg: float
-    az_at_los_deg: float
-
-
-# ---- Service ----------------------------------------------------------------
-
-
-class ISSPredictor:
+class ISSService:
     """
-    Skyfield-based ISS prediction service.
-
-    Notes:
-      - Call `await refresh_tle()` before computing passes (the cog does this).
-      - Skyfield I/O is blocking; we wrap in `asyncio.to_thread`.
-      - Results are reliable for ~1–2 weeks around the TLE epoch; refresh often.
+    Cache-only ISS pass service with a single scheduler:
+      - No database
+      - One hard-coded channel (attached by the Cog)
+      - Exactly one background loop (never started by commands)
+      - Announces once when a pass is within the 6h window
     """
+    _instance: Optional["ISSService"] = None
 
-    def __init__(self, cache_dir: str = "data/skyfield") -> None:
-        self._load = Loader(directory=cache_dir, verbose=False)
-        self._ts = self._load.timescale()
-        self._iss: Optional[EarthSatellite] = None
+    def __init__(self) -> None:
+        self._guilds: Dict[int, GuildISSState] = {}
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._bot: Optional[discord.Client] = None
+        self._channel: Optional[discord.abc.Messageable] = None
 
-    # --- TLE management ---
+        # Per-channel simple cooldown to avoid bursts
+        self._channel_cooldown_s: int = 60
+        self._channel_last_sent: int = 0
 
-    async def refresh_tle(self) -> None:
+        self._lock = asyncio.Lock()
+        self._loop_started = False
+
+    # ---------- Singleton ----------
+    @classmethod
+    def get(cls) -> "ISSService":
+        if cls._instance is None:
+            cls._instance = ISSService()
+        return cls._instance
+
+    # ---------- Lifecycle ----------
+    async def attach(self, bot: discord.Client, channel: discord.abc.Messageable, cooldown_s: int = 60) -> None:
         """
-        Fetch latest TLEs from CelesTrak and cache the ISS satellite object.
-
-        Tries multiple endpoints; falls back by NORAD 25544 if name varies.
-        Raises:
-            RuntimeError: if ISS cannot be found from any endpoint.
+        Attach the bot & target channel once. Starts the single scheduler loop.
         """
-        last_err: Optional[Exception] = None
-        for url, filename in CELESTRAK_ENDPOINTS:
-            try:
-                satellites: List[EarthSatellite] = await asyncio.to_thread(
-                    self._load.tle_file,
-                    url,
-                    True,
-                    filename,  # reload=True, filename=...
-                )
-                iss = self._find_iss(satellites)
-                if iss is not None:
-                    self._iss = iss
-                    return
-            except Exception as e:
-                last_err = e
-                continue
+        self._bot = bot
+        self._channel = channel
+        self._channel_cooldown_s = max(10, int(cooldown_s))
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        if not self._loop_started:
+            self.scheduler.start()
+            self._loop_started = True
 
-        msg = "ISS TLE not found from CelesTrak endpoints"
-        if last_err is not None:
-            msg += f" (last error: {last_err})"
-        raise RuntimeError(msg)
-
-    @staticmethod
-    def _find_iss(satellites: Iterable[EarthSatellite]) -> Optional[EarthSatellite]:
-        by_name: Dict[str, EarthSatellite] = {}
-        by_satnum: Dict[int, EarthSatellite] = {}
-        for sat in satellites:
-            try:
-                if sat.name:
-                    by_name[sat.name] = sat
-                satnum = int(getattr(sat, "model").satnum)
-                by_satnum[satnum] = sat
-            except Exception:
-                continue
-
-        # 1) Canonical name
-        if "ISS (ZARYA)" in by_name:
-            return by_name["ISS (ZARYA)"]
-        # 2) Anything with 'ISS' in name
-        for name, sat in by_name.items():
-            if "ISS" in name.upper():
-                return sat
-        # 3) NORAD catalog number
-        return by_satnum.get(25544)
-
-    def _ensure_iss(self) -> EarthSatellite:
-        if self._iss is None:
-            raise RuntimeError("ISS TLE not loaded yet; call refresh_tle() first")
-        return self._iss
-
-    # --- Observer & time helpers ---
-
-    @staticmethod
-    def _observer(lat: float, lon: float, alt_m: float):
-        return wgs84.latlon(
-            latitude_degrees=lat, longitude_degrees=lon, elevation_m=alt_m
-        )
-
-    def _now(self):
-        return self._ts.now()
-
-    @staticmethod
-    def _aware_utc(d: dt.datetime) -> dt.datetime:
-        """Make a naive UTC datetime aware-UTC (Skyfield returns naive UTC)."""
-        return d.replace(tzinfo=dt.timezone.utc)
-
-    @staticmethod
-    def _deg(angle: Any) -> float:
-        """
-        Convert a Skyfield Angle.degrees (cached 'reify', numpy scalar, ndarray[()])
-        to a plain float in a way that keeps static type-checkers happy.
-        """
-        v = getattr(angle, "degrees", None)
-        if v is None:
-            # Some unexpected type that is already number-like
-            return float(angle)
+    async def close(self) -> None:
         try:
-            return float(v)  # works for Python float or numpy scalar
+            self.scheduler.cancel()
         except Exception:
-            item = getattr(v, "item", None)
-            if callable(item):
-                return float(item())
-            return float(v)
+            pass
+        if self._session:
+            await self._session.close()
+            self._session = None
+        self._loop_started = False
 
-    def next_passes(
+    # ---------- Cache/config API (idempotent) ----------
+    async def upsert_guild(
         self,
+        guild_id: int,
         *,
-        lat: float = UCF_LAT,
-        lon: float = UCF_LON,
-        alt_m: float = UCF_ALT_M,
-        days_ahead: int = DEFAULT_PASS_SCAN_DAYS,
-        min_el_deg: float = DEFAULT_MIN_ELEVATION_DEG,
-        altitude_degrees: float = 0.0,
-    ) -> List[PassWindow]:
+        lat: float,
+        lon: float,
+        alt_m: Optional[int],
+        lead_seconds: int = 21600,
+    ) -> None:
+        """Create or replace the guild ISS settings without duplicating watchers."""
+        async with self._lock:
+            existing = self._guilds.get(guild_id)
+            self._guilds[guild_id] = GuildISSState(
+                lat=lat,
+                lon=lon,
+                alt_m=alt_m,
+                lead_seconds=max(60, int(lead_seconds)),
+                last_announced_start=(existing.last_announced_start if existing else None),
+                cached_next=(existing.cached_next if existing else None),
+                cached_at_epoch=(existing.cached_at_epoch if existing else 0),
+            )
+
+    async def get_guild(self, guild_id: int) -> Optional[GuildISSState]:
+        async with self._lock:
+            return self._guilds.get(guild_id)
+
+    async def remove_guild(self, guild_id: int) -> bool:
+        async with self._lock:
+            return self._guilds.pop(guild_id, None) is not None
+
+    # ---------- HTTP + small cache for next pass ----------
+    async def _fetch_next_pass(self, lat: float, lon: float, alt_m: Optional[int]) -> Optional[Tuple[int, int]]:
         """
-        Compute upcoming ISS passes over the given observer for the next `days_ahead` days.
+        Return (risetime_epoch, duration_s) for the next ISS pass.
         """
-        iss = self._ensure_iss()
-        obs = self._observer(lat, lon, alt_m)
+        if self._session is None:
+            return None
+        params = {"lat": lat, "lon": lon, "n": 1}
+        if alt_m is not None:
+            params["alt"] = max(0, int(alt_m))
 
-        t0 = self._now()
-        end_dt_utc = dt.datetime.now(tz=dt.timezone.utc) + dt.timedelta(days=days_ahead)
-        t1 = self._ts.from_datetime(end_dt_utc)
-        times, events = iss.find_events(obs, t0, t1, altitude_degrees=altitude_degrees)
+        try:
+            # Use a proper ClientTimeout object for type-safe timeout
+            async with self._session.get(OPEN_NOTIFY, params=params, timeout=ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return None
 
-        results: List[PassWindow] = []
-        i = 0
-        # Walk the sequence looking for triplets (rise, culminate, set)
-        while i + 2 < len(events):
-            if events[i] == 0 and events[i + 1] == 1 and events[i + 2] == 2:
-                aos_t, tca_t, los_t = times[i], times[i + 1], times[i + 2]
+        try:
+            arr = data.get("response") or []
+            if not arr:
+                return None
+            e = arr[0]
+            return int(e["risetime"]), int(e["duration"])
+        except Exception:
+            return None
 
-                # Topocentric: use (iss - obs).at(t).altaz() — no .apparent() here
-                aos_topo = (iss - obs).at(aos_t)
-                tca_topo = (iss - obs).at(tca_t)
-                los_topo = (iss - obs).at(los_t)
+    async def _next_pass_cached(self, g: GuildISSState, now_epoch: int, ttl_s: int = 120) -> Optional[Tuple[int, int]]:
+        if g.cached_next and (now_epoch - g.cached_at_epoch) <= ttl_s:
+            return g.cached_next
+        nxt = await self._fetch_next_pass(g.lat, g.lon, g.alt_m)
+        if nxt:
+            g.cached_next = nxt
+            g.cached_at_epoch = now_epoch
+        return nxt
 
-                _, aos_az, _ = aos_topo.altaz()
-                tca_alt, _, _ = tca_topo.altaz()
-                _, los_az, _ = los_topo.altaz()
+    # ---------- Single scheduler loop ----------
+    @tasks.loop(seconds=30)
+    async def scheduler(self) -> None:
+        """
+        Runs every 30s, checks all guilds, and posts at most one bundled message per cooldown window.
+        Announces ONLY when a pass is within the 6h (lead_seconds) window AND hasn't been announced yet.
+        """
+        if not self._bot or not self._channel:
+            return
 
-                max_el = self._deg(tca_alt)
-                if max_el >= min_el_deg:
-                    results.append(
-                        PassWindow(
-                            aos=self._aware_utc(aos_t.utc_datetime()),
-                            tca=self._aware_utc(tca_t.utc_datetime()),
-                            los=self._aware_utc(los_t.utc_datetime()),
-                            max_elevation_deg=max_el,
-                            az_at_aos_deg=self._deg(aos_az),
-                            az_at_los_deg=self._deg(los_az),
-                        )
-                    )
-                i += 3
-            else:
-                i += 1
+        now_epoch = int(discord.utils.utcnow().timestamp())
 
-        return results
+        # Channel cooldown to prevent bursts
+        if (now_epoch - self._channel_last_sent) < self._channel_cooldown_s:
+            return
 
-    def next_pass(
-        self,
-        *,
-        lat: float = UCF_LAT,
-        lon: float = UCF_LON,
-        alt_m: float = UCF_ALT_M,
-        days_ahead: int = DEFAULT_PASS_SCAN_DAYS,
-        min_el_deg: float = DEFAULT_MIN_ELEVATION_DEG,
-    ) -> Optional[PassWindow]:
-        """Convenience: get the very next pass (or None if no pass meets filter)."""
-        passes = self.next_passes(
-            lat=lat, lon=lon, alt_m=alt_m, days_ahead=days_ahead, min_el_deg=min_el_deg
-        )
-        return passes[0] if passes else None
+        # Snapshot guilds to iterate without holding lock during network I/O
+        async with self._lock:
+            items = list(self._guilds.items())
+
+        lines: list[str] = []
+        updated_any = False
+
+        for guild_id, g in items:
+            nxt = await self._next_pass_cached(g, now_epoch)
+            if not nxt:
+                continue
+
+            start_epoch, duration_s = nxt
+            # Post exactly once when within lead_seconds and not yet announced for this risetime
+            if (start_epoch - now_epoch) <= g.lead_seconds and (g.last_announced_start != start_epoch):
+                g.last_announced_start = start_epoch
+                updated_any = True
+                hours = max(0, (start_epoch - now_epoch) // 3600)
+                when_txt = "now" if hours == 0 else f"in ~{hours}h"
+                lines.append(
+                    f"**ISS pass for guild {guild_id}** {when_txt} "
+                    f"(starts `<t:{start_epoch}:f>`, duration ~{duration_s // 60} min)."
+                )
+
+        if not lines:
+            return
+
+        # Tiny jitter so multiple instances don't sync-blast
+        await asyncio.sleep(random.uniform(0.0, 1.25))
+
+        try:
+            await self._channel.send("\n".join(lines))
+            self._channel_last_sent = now_epoch
+        finally:
+            # Persist in-memory 'last_announced_start' updates
+            if updated_any:
+                async with self._lock:
+                    for gid, g in items:
+                        self._guilds[gid] = g

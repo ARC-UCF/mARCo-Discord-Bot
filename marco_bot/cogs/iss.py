@@ -1,382 +1,216 @@
 from __future__ import annotations
 
-import asyncio
-import datetime as dt
-from typing import Optional, Tuple, cast
+import os
+from typing import Optional
 
 import discord
 from discord import app_commands
-from discord.ext import commands, tasks
-from zoneinfo import ZoneInfo
+from discord.ext import commands
 
-from ..services.iss_services import (
-    ISSPredictor,
-    PassWindow,
-    UCF_LAT,
-    UCF_LON,
-    UCF_ALT_M,
-    DEFAULT_PASS_SCAN_DAYS,
-    DEFAULT_MIN_ELEVATION_DEG,
-)
+from marco_bot.services.iss_services import ISSService
 
+# --------- HARD-CODED CHANNEL ID (env can override) ---------
+ISS_CHANNEL_ID = int(os.getenv("ISS_CHANNEL_ID", "1331398977291161733"))  
 
-TLE_REFRESH_HOURS = 6  # refresh TLEs regularly
-NOTIFY_EARLY_HOURS = 6  # 6 hours before AOS
-LOCAL_TZ = ZoneInfo("America/New_York")  # Orlando / UCF
-SAME_DAY_LOCAL_HOUR = 8  # 08:00 local (same-day heads-up time)
-EMBED_COLOR = 0x2B6CB0  # nice blue
+# --------- DEFAULT LOCATION: Orlando / UCF ---------
+DEFAULT_LAT = 28.6024
+DEFAULT_LON = -81.2001
+DEFAULT_ALT_M: Optional[int] = 30
+DEFAULT_LEAD_SECONDS = 21600         # 6 hours
 
-# SSTV event defaults (can be overridden per-command)
-SSTV_FREQ_MHZ_DEFAULT = 145.800
-SSTV_MODE_DEFAULT = "FM (NFM), SSTV"
+# --------- WHITELIST: non-admin users who can always run commands ---------
+WHITELIST_USER_IDS = {402541897148792836}
 
 
-class ISSCog(commands.Cog):
-    """ISS pass predictions, notifications, and slash commands for UCF/Orlando."""
+def is_admin_or_whitelisted():
+    """Allow admins or specific whitelisted users to run protected commands."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        # Always allow whitelisted users
+        if interaction.user.id in WHITELIST_USER_IDS:
+            return True
+        # Allow server administrators
+        if isinstance(interaction.user, discord.Member):
+            perms = interaction.user.guild_permissions
+            return bool(perms.administrator)
+        return False
+    return app_commands.check(predicate)
 
-    group = app_commands.Group(name="iss", description="ISS pass tools")
 
+class ISS(commands.Cog):
+    """
+    ISS pass reminders:
+      - Single scheduler (started in cog_load)
+      - Cache-only (no DB)
+      - Posts once to the hard-coded channel when within 6h of a pass
+      - Auto-subscribes all guilds to Orlando/UCF on startup (no /subscribe needed)
+      - Commands restricted to admins OR whitelisted users (by ID)
+    """
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.predictor = ISSPredictor()
-        self._subscriptions: set[int] = set()  # channel IDs
-        self._scheduled: dict[int, Tuple[dt.datetime, dt.datetime]] = (
-            {}
-        )  # ch_id -> (aos, los)
-        self._tle_ready = asyncio.Event()  # set once TLEs are available
+        self.svc = ISSService.get()
 
-        # Background loops
-        self.tle_refresher.start()
-        self.pass_notifier.start()
-
-    async def cog_unload(self) -> None:
-        self.tle_refresher.cancel()
-        self.pass_notifier.cancel()
-
-    # ------------------------ TLE refresh loop ------------------------
-
-    @tasks.loop(hours=TLE_REFRESH_HOURS)
-    async def tle_refresher(self) -> None:
-        try:
-            await self.predictor.refresh_tle()
-            if not self._tle_ready.is_set():
-                self._tle_ready.set()
-                print("[iss] TLEs available")
-        except Exception as e:
-            print(f"[iss] TLE refresh failed: {e}")
-
-    @tle_refresher.before_loop
-    async def _wait_ready_tle(self) -> None:
-        await self.bot.wait_until_ready()
-        attempts, delay = 0, 10
-        while True:
+    async def cog_load(self):
+        # Resolve the hard-coded channel once and attach the service
+        ch = self.bot.get_channel(ISS_CHANNEL_ID)
+        if ch is None:
             try:
-                await self.predictor.refresh_tle()
-                self._tle_ready.set()
-                print("[iss] initial TLE fetch OK")
-                return
-            except Exception as e:
-                attempts += 1
-                print(f"[iss] initial TLE fetch failed (attempt {attempts}): {e}")
-                await asyncio.sleep(min(delay, 300))  # cap at 5 minutes
-                delay = max(10, int(delay * 1.8))
-                if attempts >= 10:
-                    print("[iss] giving up for now; refresher loop will keep trying")
-                    return
+                ch = await self.bot.fetch_channel(ISS_CHANNEL_ID)
+            except discord.HTTPException:
+                ch = None
 
-    # ------------------------ Pass notifier loop ---------------------
-
-    @tasks.loop(minutes=15)
-    async def pass_notifier(self) -> None:
-        """Every 15 minutes, check the next pass and ensure reminders are scheduled."""
-        if not self._subscriptions or not self._tle_ready.is_set():
+        # Ensure we attach only if the channel is actually messageable
+        if isinstance(ch, (discord.TextChannel, discord.Thread, discord.DMChannel)):
+            # 60s per-channel cooldown to avoid bursts
+            await self.svc.attach(self.bot, ch, cooldown_s=60)
+        else:
+            # Could be CategoryChannel or not found
+            print(f"[ISS] Channel {ISS_CHANNEL_ID} is not a messageable channel (resolved={type(ch).__name__ if ch else None}). ISS reminders disabled.")
             return
 
-        try:
-            passes = self.predictor.next_passes(
-                lat=UCF_LAT,
-                lon=UCF_LON,
-                alt_m=UCF_ALT_M,
-                days_ahead=DEFAULT_PASS_SCAN_DAYS,
-                min_el_deg=DEFAULT_MIN_ELEVATION_DEG,
+        # --------- AUTO-SUBSCRIBE ALL CURRENT GUILDS TO ORLANDO/UCF ---------
+        for g in self.bot.guilds:
+            await self.svc.upsert_guild(
+                g.id,
+                lat=DEFAULT_LAT,
+                lon=DEFAULT_LON,
+                alt_m=DEFAULT_ALT_M,
+                lead_seconds=DEFAULT_LEAD_SECONDS,
             )
-        except Exception as e:
-            print(f"[iss] pass compute failed: {e}")
-            return
+        print(f"[ISS] Auto-subscribed {len(self.bot.guilds)} guild(s) to Orlando/UCF defaults.")
 
-        if not passes:
-            return
-
-        next_pass = passes[0]
-        for ch_id in list(self._subscriptions):
-            if self._scheduled.get(ch_id) == (next_pass.aos, next_pass.los):
-                continue
-
-            chan = self.bot.get_channel(ch_id)
-            if not isinstance(chan, discord.abc.Messageable):
-                self._subscriptions.discard(ch_id)
-                self._scheduled.pop(ch_id, None)
-                continue
-
-            channel = cast(discord.abc.Messageable, chan)
-
-            early_at_utc = next_pass.aos - dt.timedelta(hours=NOTIFY_EARLY_HOURS)
-            same_day_local = next_pass.aos.astimezone(LOCAL_TZ).replace(
-                hour=SAME_DAY_LOCAL_HOUR, minute=0, second=0, microsecond=0
-            )
-            same_day_utc = same_day_local.astimezone(dt.timezone.utc)
-
-            asyncio.create_task(
-                self._notify_at(
-                    channel,
-                    early_at_utc,
-                    next_pass,
-                    label=f"{NOTIFY_EARLY_HOURS}h before",
-                )
-            )
-            asyncio.create_task(
-                self._notify_at(channel, same_day_utc, next_pass, label="today")
-            )
-
-            self._scheduled[ch_id] = (next_pass.aos, next_pass.los)
-
-    @pass_notifier.before_loop
-    async def _wait_ready_notifier(self) -> None:
-        await self.bot.wait_until_ready()
+    async def cog_unload(self):
         try:
-            await asyncio.wait_for(self._tle_ready.wait(), timeout=60)
-        except asyncio.TimeoutError:
-            print("[iss] starting notifier without TLEs; will pick up when ready")
-
-    async def _notify_at(
-        self,
-        channel: discord.abc.Messageable,
-        when_utc: dt.datetime,
-        p: PassWindow,
-        *,
-        label: str,
-    ) -> None:
-        """Sleep until when_utc (if in the future), then send a reminder line."""
-        now = dt.datetime.now(tz=dt.timezone.utc)
-        if when_utc > now:
-            await asyncio.sleep((when_utc - now).total_seconds())
-
-        if p.aos <= dt.datetime.now(tz=dt.timezone.utc):
-            return  # already occurred
-
-        try:
-            await channel.send(self._one_line(p))
-        except Exception as e:
-            print(f"[iss] failed to send reminder: {e}")
-
-    # ------------------------ Formatting helpers ---------------------
-
-    @staticmethod
-    def _fmt_date_local(t: dt.datetime) -> str:
-        return t.astimezone(LOCAL_TZ).strftime("%Y-%m-%d")
-
-    @staticmethod
-    def _fmt_hm24(t: dt.datetime) -> str:
-        return t.astimezone(LOCAL_TZ).strftime("%H:%M")
-
-    @staticmethod
-    def _tz_abbr(t: dt.datetime) -> str:
-        return t.astimezone(LOCAL_TZ).strftime("%Z")  # EDT/EST
-
-    @staticmethod
-    def _fmt_dur(a: dt.datetime, b: dt.datetime) -> str:
-        secs = int((b - a).total_seconds())
-        mins, s = divmod(max(secs, 0), 60)
-        return f"{mins}m{s:02d}s"
-
-    def _one_line(self, p: PassWindow) -> str:
-        """Single compact line (Orlando time), with bold highlights and no duplicates."""
-        date = self._fmt_date_local(p.aos)
-        aos = self._fmt_hm24(p.aos)
-        tca = self._fmt_hm24(p.tca)
-        los = self._fmt_hm24(p.los)
-        tz = self._tz_abbr(p.aos)
-        dur = self._fmt_dur(p.aos, p.los)
-        maxel = f"{p.max_elevation_deg:.0f}°"
-        az = f"{p.az_at_aos_deg:.0f}→{p.az_at_los_deg:.0f}"
-        # Example:
-        # 2025-09-27 • ISS • **AOS 21:41 EDT**  TCA 21:47  LOS 21:52  • **Dur 10m34s** • **maxEL 49°** • AZ 322→127
-        return (
-            f"{date} • ISS • **AOS {aos} {tz}**  TCA {tca}  LOS {los}  "
-            f"• **Dur {dur}** • **maxEL {maxel}** • AZ {az}"
-        )
-
-    def _sstv_header(self, freq_mhz: float, mode: str) -> str:
-        return f"📡 **ARISS SSTV** • **{freq_mhz:.3f} MHz** • **{mode}** • Orlando (America/New_York)"
-
-    # ------------------------ Slash commands ------------------------
-
-    @group.command(name="next", description="Show the next ISS pass over Orlando / UCF")
-    async def iss_next(self, interaction: discord.Interaction):
-        try:
-            plist = self.predictor.next_passes()
+            await self.svc.close()
         except Exception:
-            try:
-                await self.predictor.refresh_tle()
-                self._tle_ready.set()
-                plist = self.predictor.next_passes()
-            except Exception as e2:
-                return await interaction.response.send_message(
-                    f"Error computing passes (TLEs unavailable): {e2}", ephemeral=True
-                )
+            pass
 
-        if not plist:
-            return await interaction.response.send_message(
-                "No passes found in the next few days.", ephemeral=True
-            )
+    # When the bot joins a new guild later, auto-subscribe it too.
+    @commands.Cog.listener()
+    async def on_guild_join(self, guild: discord.Guild):
+        await self.svc.upsert_guild(
+            guild.id,
+            lat=DEFAULT_LAT,
+            lon=DEFAULT_LON,
+            alt_m=DEFAULT_ALT_M,
+            lead_seconds=DEFAULT_LEAD_SECONDS,
+        )
+        print(f"[ISS] Auto-subscribed new guild {guild.id} to Orlando/UCF defaults.")
 
-        # Bolded single-line summary
-        await interaction.response.send_message(self._one_line(plist[0]))
+    # ---------------- Slash Commands (available to admins + whitelisted users) ----------------
 
-    @group.command(
-        name="passes", description="List upcoming ISS passes (Orlando / UCF)"
+    @app_commands.command(
+        name="subscribe",
+        description="Enable/override ISS reminders for this server (6h lead, posts once).",
     )
+    @is_admin_or_whitelisted()
+    @app_commands.checks.cooldown(1, 10)
     @app_commands.describe(
-        days=f"Days ahead to scan (default {DEFAULT_PASS_SCAN_DAYS})",
-        min_elevation=f"Minimum max elevation in degrees (default {DEFAULT_MIN_ELEVATION_DEG})",
-        count="How many lines to show (1-10, default 5)",
+        lat="Latitude (-90..90)",
+        lon="Longitude (-180..180)",
+        alt_m="Altitude in meters (optional, 0..10000)",
+        lead_seconds="Lead time in seconds (default 21600 = 6 hours)",
     )
-    async def iss_passes(
+    async def subscribe(
         self,
         interaction: discord.Interaction,
-        days: Optional[int] = None,
-        min_elevation: Optional[float] = None,
-        count: Optional[int] = 5,
+        lat: float = DEFAULT_LAT,
+        lon: float = DEFAULT_LON,
+        alt_m: Optional[int] = DEFAULT_ALT_M,
+        lead_seconds: Optional[int] = DEFAULT_LEAD_SECONDS,
     ):
-        d = days if days is not None else DEFAULT_PASS_SCAN_DAYS
-        me = min_elevation if min_elevation is not None else DEFAULT_MIN_ELEVATION_DEG
-        n = max(1, min(10, count or 5))
+        if not interaction.guild_id:
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
 
-        try:
-            plist = self.predictor.next_passes(days_ahead=d, min_el_deg=me)
-        except Exception:
-            try:
-                await self.predictor.refresh_tle()
-                self._tle_ready.set()
-                plist = self.predictor.next_passes(days_ahead=d, min_el_deg=me)
-            except Exception as e2:
-                return await interaction.response.send_message(
-                    f"Error computing passes (TLEs unavailable): {e2}", ephemeral=True
-                )
+        # sanitize inputs
+        lat = max(-90.0, min(90.0, float(lat)))
+        lon = max(-180.0, min(180.0, float(lon)))
+        alt_m = None if alt_m is None else max(0, min(10000, int(alt_m)))
+        lead = max(60, int(lead_seconds or DEFAULT_LEAD_SECONDS))
 
-        if not plist:
-            return await interaction.response.send_message(
-                f"No passes with max elevation ≥ {me}° in the next {d} day(s).",
-                ephemeral=True,
-            )
-
-        # Blank line between bullets for readability
-        lines = [f"• {self._one_line(p)}" for p in plist[:n]]
-        body = "\n\n".join(lines)
-
-        title = f"Upcoming ISS passes • Orlando (next {d} day{'s' if d != 1 else ''})"
-        emb = discord.Embed(title=title, description=body, color=EMBED_COLOR)
-        emb.set_footer(text="Times shown in Orlando (America/New_York)")
-        await interaction.response.send_message(embed=emb)
-
-    @group.command(
-        name="sstv",
-        description="SSTV event view: passes + frequency/mode header (Orlando)",
-    )
-    @app_commands.describe(
-        count="How many lines to show (1-10, default 5)",
-        min_elevation="Minimum max elevation (default 20°)",
-        freq_mhz="Downlink frequency in MHz (default 145.800)",
-        mode="Mode (default 'FM (NFM), SSTV')",
-        days=f"Days ahead to scan (default {DEFAULT_PASS_SCAN_DAYS})",
-    )
-    async def iss_sstv(
-        self,
-        interaction: discord.Interaction,
-        count: Optional[int] = 5,
-        min_elevation: Optional[float] = 20.0,
-        freq_mhz: Optional[float] = None,
-        mode: Optional[str] = None,
-        days: Optional[int] = None,
-    ):
-        n = max(1, min(10, count or 5))
-        me = float(min_elevation if min_elevation is not None else 20.0)
-        d = days if days is not None else DEFAULT_PASS_SCAN_DAYS
-        freq = float(freq_mhz if freq_mhz is not None else SSTV_FREQ_MHZ_DEFAULT)
-        m = mode if mode is not None else SSTV_MODE_DEFAULT
-
-        try:
-            plist = self.predictor.next_passes(days_ahead=d, min_el_deg=me)
-        except Exception:
-            try:
-                await self.predictor.refresh_tle()
-                self._tle_ready.set()
-                plist = self.predictor.next_passes(days_ahead=d, min_el_deg=me)
-            except Exception as e2:
-                return await interaction.response.send_message(
-                    f"Error computing passes (TLEs unavailable): {e2}", ephemeral=True
-                )
-
-        if not plist:
-            return await interaction.response.send_message(
-                f"No passes with max elevation ≥ {me:.0f}° in the next {d} day(s).",
-                ephemeral=True,
-            )
-
-        header = self._sstv_header(freq, m)
-        lines = [f"• {self._one_line(p)}" for p in plist[:n]]
-        body = header + "\n\n" + "\n\n".join(lines)
-
-        emb = discord.Embed(
-            title=f"SSTV Event • Orlando (next {d} day{'s' if d != 1 else ''})",
-            description=body,
-            color=EMBED_COLOR,
+        await self.svc.upsert_guild(
+            interaction.guild_id,
+            lat=lat,
+            lon=lon,
+            alt_m=alt_m,
+            lead_seconds=lead,
         )
-        emb.set_footer(
-            text="Tip: Point at AOS azimuth first, sweep along AZ path • Times in Orlando (America/New_York)"
-        )
-        await interaction.response.send_message(embed=emb)
 
-    # ------------------------ Admin-only controls --------------------
-
-    @group.command(
-        name="subscribe", description="Enable channel reminders (today + 6h before AOS)"
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def iss_subscribe(self, interaction: discord.Interaction):
-        ch = interaction.channel
-        ch_id: Optional[int] = getattr(ch, "id", None)
-        if ch_id is None:
-            return await interaction.response.send_message(
-                "Cannot subscribe: no channel context available.", ephemeral=True
-            )
-        self._subscriptions.add(ch_id)
         await interaction.response.send_message(
-            "✅ Subscribed this channel for ISS pass reminders (Orlando).",
+            f"✅ Subscribed (or updated). I’ll post exactly once in <#{ISS_CHANNEL_ID}> ~6h before each pass.\n"
+            f"• Location: lat `{lat}`, lon `{lon}`, alt `{alt_m or 0}m`\n"
+            f"• Lead window: `{lead}` seconds.",
             ephemeral=True,
         )
 
-    @group.command(
-        name="unsubscribe", description="Disable ISS reminders in this channel"
+    @app_commands.command(
+        name="update",
+        description="Update the ISS settings for this server (cache-only).",
     )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def iss_unsubscribe(self, interaction: discord.Interaction):
-        ch = interaction.channel
-        ch_id: Optional[int] = getattr(ch, "id", None)
-        if ch_id is None:
-            return await interaction.response.send_message(
-                "Cannot unsubscribe: no channel context available.", ephemeral=True
-            )
-        self._subscriptions.discard(ch_id)
-        self._scheduled.pop(ch_id, None)
+    @is_admin_or_whitelisted()
+    @app_commands.checks.cooldown(1, 10)
+    @app_commands.describe(
+        lat="Latitude (-90..90)",
+        lon="Longitude (-180..180)",
+        alt_m="Altitude in meters (0..10000)",
+        lead_seconds="Lead time in seconds (>=60; default 21600 = 6 hours)",
+    )
+    async def update(
+        self,
+        interaction: discord.Interaction,
+        lat: Optional[float] = None,
+        lon: Optional[float] = None,
+        alt_m: Optional[int] = None,
+        lead_seconds: Optional[int] = None,
+    ):
+        if not interaction.guild_id:
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        # Read current config (may be None if somehow not auto-subscribed)
+        cfg = await self.svc.get_guild(interaction.guild_id)
+
+        # Compute safe base values (fallback to defaults if cfg is None)
+        base_lat = DEFAULT_LAT if cfg is None else cfg.lat
+        base_lon = DEFAULT_LON if cfg is None else cfg.lon
+        base_alt = DEFAULT_ALT_M if cfg is None else cfg.alt_m
+        base_lead = DEFAULT_LEAD_SECONDS if cfg is None else cfg.lead_seconds
+
+        # Merge with provided overrides
+        new_lat = base_lat if lat is None else max(-90.0, min(90.0, float(lat)))
+        new_lon = base_lon if lon is None else max(-180.0, min(180.0, float(lon)))
+        new_alt = base_alt if alt_m is None else max(0, min(10000, int(alt_m)))
+        new_lead = base_lead if lead_seconds is None else max(60, int(lead_seconds))
+
+        await self.svc.upsert_guild(
+            interaction.guild_id,
+            lat=new_lat,
+            lon=new_lon,
+            alt_m=new_alt,
+            lead_seconds=new_lead,
+        )
+
         await interaction.response.send_message(
-            "✅ Unsubscribed this channel from ISS pass reminders.", ephemeral=True
+            f"🔁 Updated for <#{ISS_CHANNEL_ID}> — lat `{new_lat}`, lon `{new_lon}`, alt `{new_alt or 0}m`, "
+            f"lead `{new_lead}` seconds.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="unsubscribe",
+        description="Disable ISS reminders for this server.",
+    )
+    @is_admin_or_whitelisted()
+    @app_commands.checks.cooldown(1, 5)
+    async def unsubscribe(self, interaction: discord.Interaction):
+        if not interaction.guild_id:
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+        removed = await self.svc.remove_guild(interaction.guild_id)
+        await interaction.response.send_message(
+            "🛑 Stopped ISS reminders for this server." if removed else "Not tracking.", ephemeral=True
         )
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(ISSCog(bot))
+    await bot.add_cog(ISS(bot))
