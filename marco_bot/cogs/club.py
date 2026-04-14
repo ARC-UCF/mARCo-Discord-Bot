@@ -2,6 +2,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import json
+import random
+
 ARC_SITE = "http://k4ucf.ucf.edu/"
 ARC_WIKI = "https://newton.i2lab.ucf.edu/wiki/"
 ARRL_POOLS = "https://www.arrl.org/question-pools"
@@ -37,6 +40,12 @@ EXAMS = {
     "tech": {"element": 2, "total": 35, "pass": "26/35 (74%)"},
     "general": {"element": 3, "total": 35, "pass": "26/35 (74%)"},
     "extra": {"element": 4, "total": 50, "pass": "37/50 (74%)"},
+}
+
+POOLS = {
+    "tech": json.loads(open("./marco_bot/cogs/question_pools/technician-2026-2030.json").read()),
+    "general": json.loads(open("./marco_bot/cogs/question_pools/general-2023-2027.json").read()),
+    "extra": json.loads(open("./marco_bot/cogs/question_pools/extra-2024-2028.json").read())
 }
 
 
@@ -93,6 +102,24 @@ class Education(commands.Cog):
                 inline=False,
             )
         await interaction.response.send_message(embed=embed, ephemeral=False)
+
+    @app_commands.command(description="Ask a random test question")
+    @app_commands.describe(
+        level="tech | general | extra"
+    )
+    async def quiz(self, interaction: discord.Interaction, level: str):
+        key = level.lower()
+        if key not in POOLS:
+            return await interaction.response.send_message(
+                "Levels: tech, general, extra", ephemeral=True
+            )
+        question = POOLS[key][random.randrange(0, len(POOLS[key]) - 1)]
+        embed = discord.Embed(title=f"({question["id"]}) {question["question"]}")
+        embed.add_field(name=f"Correct answer: ||{question["correct_letter"]}||", value="", inline=False)
+        for i in range(len(question["answers"])):
+            embed.add_field(name=f"{["A","B","C","D"][i]}: {question["answers"][i]}", value="", inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 
 async def setup(bot):
