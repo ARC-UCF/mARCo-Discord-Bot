@@ -111,7 +111,7 @@ class Education(commands.Cog):
         key = level.lower()
         if key not in POOLS:
             return await interaction.response.send_message(
-                "Levels: tech, general, extra", ephemeral=True
+                "Levels: tech, general, extra", ephemeral=False
             )
         question = POOLS[key][random.randrange(0, len(POOLS[key]) - 1)]
         embed = discord.Embed(title=f"({question["id"]}) {question["question"]}")
