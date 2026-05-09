@@ -118,7 +118,7 @@ class Education(commands.Cog):
         embed.add_field(name=f"Correct answer: ||{question["correct_letter"]}||", value="", inline=False)
         for i in range(len(question["answers"])):
             embed.add_field(name=f"{["A","B","C","D"][i]}: {question["answers"][i]}", value="", inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, ephemeral=False)
 
 
 
